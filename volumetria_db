@@ -5,65 +5,77 @@ from pyspark.sql.functions import col, sum as _sum
 databases = ["db1", "db2"]
 dias = ["2025-08-01", "2025-08-02"]
 
-history_results = []
-detail_results = []
+results = []
 
-for database in databases:
-    tables = [t.name for t in spark.catalog.listTables(database)]
-    
-    for table in tables:
+for db in databases:
+    tables = spark.catalog.listTables(db)
+    for t in tables:
+        full_table = f"{db}.{t.name}"
+
         for dia in dias:
-            table_name = f"{database}.{table}"
 
+            # 1) history
             try:
-                # --- PRIMEIRA TENTATIVA: DESCRIBE HISTORY ---
-                history = spark.sql(f"DESCRIBE HISTORY {table_name}") \
-                    .filter(col("timestamp").cast("date") == dia)
+                hist = spark.sql(f"DESCRIBE HISTORY {full_table}")
+                hist_filtered = (
+                    hist
+                    .filter(F.col("timestamp").cast("date") == F.lit(dia))
+                    .select("operationMetrics", "timestamp")
+                    .limit(1)
+                ).collect()
 
-                if "operationMetrics" in history.columns:
-                    row = history.select("operationMetrics").orderBy(col("version").desc()).first()
-                    if row and row.operationMetrics:
-                        numRows = int(row.operationMetrics.get("numOutputRows", -1))
-                        numBytes = int(row.operationMetrics.get("numOutputBytes", -1))
-                        history_results.append(Row(database=database, table=table, dia=dia,
-                                                   numRows=numRows, sizeInBytes=numBytes))
-                        continue  # já pegou do history, pula para próxima
+                if hist_filtered:
+                    op = hist_filtered[0].operationMetrics.asDict()
+                    results.append(
+                        (db, t.name, dia,
+                         int(op.get("numOutputRows", 0)),
+                         int(op.get("numOutputBytes", 0)),
+                         "history")
+                    )
+            except:
+                pass
 
-                # se chegou aqui, não encontrou no history
-                raise Exception("Sem métricas no history")
+            # 2) detail
+            try:
+                detail = spark.sql(f"DESCRIBE DETAIL {full_table}").collect()[0]
+                size_in_bytes = detail.sizeInBytes or 0
+                num_files = detail.numFiles or 1
+                avg_size = size_in_bytes // num_files
+                num_rows = detail.numRows or 0
 
-            except Exception as e:
-                try:
-                    # --- FALLBACK: DESCRIBE DETAIL + COUNT ---
-                    detail = spark.sql(f"DESCRIBE DETAIL {table_name}").first()
-                    sizeInBytes = int(detail.sizeInBytes) if detail and detail.sizeInBytes else -1
+                results.append(
+                    (db, t.name, dia,
+                     num_rows,
+                     avg_size,
+                     "detail")
+                )
+            except:
+                pass
 
-                    # identificar partição
-                    partition_cols = detail.partitionColumns if detail else []
-                    if partition_cols:
-                        partition_col = partition_cols[0]  # assume só 1 partição
-                        numRows = spark.table(table_name).filter(col(partition_col) == dia).count()
-                    else:
-                        # se não tem partição, faz count completo (cuidado com tabelas grandes!)
-                        numRows = spark.table(table_name).count()
+            # 3) count sempre
+            try:
+                partitions = spark.sql(f"SHOW PARTITIONS {full_table}").collect()
+                part_col = None
+                if partitions:
+                    part_col = partitions[0][0].split("=")[0]
 
-                    detail_results.append(Row(database=database, table=table, dia=dia,
-                                              numRows=numRows, sizeInBytes=sizeInBytes))
+                if part_col:
+                    cnt = spark.sql(f"SELECT count(*) as c FROM {full_table} WHERE {part_col} = '{dia}'").collect()[0].c
+                else:
+                    cnt = spark.sql(f"SELECT count(*) as c FROM {full_table}").collect()[0].c
 
-                except Exception as e2:
-                    # fallback final → erro
-                    detail_results.append(Row(database=database, table=table, dia=dia,
-                                              numRows=-1, sizeInBytes=-1))
+                results.append((db, t.name, dia, cnt, 0, "count"))
+            except:
+                pass
 
-# --- criar dataframes separados ---
-history_df = spark.createDataFrame(history_results)
-detail_df = spark.createDataFrame(detail_results)
+# cria DF final
+df = spark.createDataFrame(results, ["database", "table", "dia", "num_rows", "size_bytes", "source"])
 
-# --- agrupar por database ---
-history_agg = history_df.groupBy("database", "dia") \
-    .agg(_sum("numRows").alias("total_rows"),
-         _sum("sizeInBytes").alias("total_size_bytes"))
-
-detail_agg = detail_df.groupBy("database", "dia") \
-    .agg(_sum("numRows").alias("total_rows"),
-         _sum("sizeInBytes").alias("total_size_bytes"))
+# salva em tabela particionada Delta
+(
+    df.write
+    .format("delta")
+    .mode("append")
+    .partitionBy("database", "table", "dia")
+    .saveAsTable("monitoring.table_metrics")
+)
