@@ -1,0 +1,51 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import sum as _sum
+
+spark = SparkSession.builder.getOrCreate()
+
+# Lista de databases e datas que você quer analisar
+databases = ["db1", "db2"]               # substitua pelos seus databases
+datas = ["2025-08-01", "2025-08-02"]     # substitua pelas datas desejadas
+
+results = []
+
+for db in databases:
+    tables = spark.sql(f"SHOW TABLES IN {db}").collect()
+    
+    for row in tables:
+        tbl = f"{row.database}.{row.tableName}"
+        
+        try:
+            history = spark.sql(f"DESCRIBE HISTORY {tbl}")
+            
+            for dt in datas:
+                version_info = (history
+                                .filter(f"date(timestamp) = '{dt}'")
+                                .orderBy("version", ascending=False)
+                                .limit(1)
+                                .collect())
+                
+                if version_info:
+                    version = version_info[0].version
+                    detail = spark.sql(f"DESCRIBE DETAIL {tbl} VERSION AS OF {version}").collect()[0]
+                    
+                    results.append((db, dt, detail.numRows, detail.sizeInBytes))
+                else:
+                    results.append((db, dt, None, None))
+        
+        except Exception as e:
+            results.append((db, None, None, None))
+
+# cria DataFrame consolidado (agrupado já direto no Spark)
+schema = ["database", "data_ref", "numRows", "sizeInBytes"]
+df_temp = spark.createDataFrame(results, schema=schema)
+
+df_agrupado = df_temp.groupBy("database", "data_ref").agg(
+    _sum("numRows").alias("total_rows"),
+    _sum("sizeInBytes").alias("total_size_bytes")
+)
+
+# salva como Delta, particionado por data_ref
+df_agrupado.write.format("delta").mode("append").partitionBy("data_ref").saveAsTable("inventario_db_agrupado")
+
+print("Inventário agrupado por database e particionado por dia salvo com sucesso!")
